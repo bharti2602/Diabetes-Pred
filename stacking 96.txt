@@ -1,0 +1,214 @@
+# Install required packages if needed (uncomment to run in notebook)
+# !pip install optuna catboost pytorch_tabnet xgboost lightgbm imblearn boruta scikit-learn pandas numpy
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import PolynomialFeatures, RobustScaler
+from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from boruta import BorutaPy
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.ensemble import RandomForestClassifier, VotingClassifier, StackingClassifier
+from sklearn.neural_network import MLPClassifier
+from imblearn.combine import SMOTEENN
+from xgboost import XGBClassifier
+from lightgbm import LGBMClassifier
+from catboost import CatBoostClassifier
+import warnings
+warnings.filterwarnings("ignore")
+
+# Helper: Safe qcut function for binning
+def safe_qcut(df, col, bins, labels):
+    try:
+        return pd.qcut(df[col], q=bins, labels=labels, duplicates='drop')
+    except Exception as e:
+        msg = str(e)
+        if "Bin labels must be one fewer" in msg:
+            edges = pd.qcut(df[col], q=bins, retbins=True, duplicates='drop')[1]
+            n_bins = len(edges) - 1
+            if n_bins < len(labels):
+                labels = labels[:n_bins]
+            return pd.qcut(df[col], q=bins, labels=labels, duplicates='drop')
+        elif "Bin edges must be unique" in msg:
+            if bins > 2:
+                return safe_qcut(df, col, bins-1, labels[:-1])
+            else:
+                return pd.qcut(df[col], q=2, duplicates='drop')
+        else:
+            raise e
+
+# Load dataset
+df = pd.read_csv("diabetes_balanced_4631_each_class.csv")
+df['Diabetes_012'] = df['Diabetes_012'].astype(int)
+
+# Feature Engineering
+df['RiskScore'] = (df['GenHlth']*2 + df['HighBP']*1.5 + df['HighChol']*1.2 + (df['PhysHlth']/30) + (df['MentHlth']/30))
+df['AgeBMI_Risk'] = df['Age'] * df['BMI']
+df['HealthComposite'] = df['PhysHlth'] + df['MentHlth']
+df['CholBP_Interaction'] = df['HighBP'] * df['HighChol']
+df['SmokerHvyAlcohol_Interaction'] = df['Smoker'] * df['HvyAlcoholConsump']
+
+# Binning
+df['BMI_Quantile'] = safe_qcut(df, 'BMI', 4, ['Low', 'MidLow', 'MidHigh', 'High'])
+df['Age_Quantile'] = safe_qcut(df, 'Age', 4, ['Young', 'Adult', 'Senior', 'Elder'])
+df['Phys_Quantile'] = safe_qcut(df, 'PhysHlth', 4, ['P1', 'P2', 'P3', 'P4'])
+df['Ment_Quantile'] = safe_qcut(df, 'MentHlth', 4, ['M1', 'M2', 'M3', 'M4'])
+df['RiskScore_Quantile'] = safe_qcut(df, 'RiskScore', 4, ['R1', 'R2', 'R3', 'R4'])
+
+# Drop raw columns replaced by engineered or binned features
+df.drop(columns=['MentHlth', 'PhysHlth', 'Income', 'BMI', 'Age'], inplace=True)
+
+# Features and labels
+X = df.drop(columns=['Diabetes_012'])
+y = df['Diabetes_012']
+
+# One-hot encode categorical variables (like binning results)
+X_encoded = pd.get_dummies(X, drop_first=True)
+
+# Boruta Feature Selection
+rf_boruta = RandomForestClassifier(n_estimators=150, random_state=42, n_jobs=-1, max_depth=7)
+boruta_selector = BorutaPy(rf_boruta, n_estimators='auto', verbose=0, random_state=42)
+boruta_selector.fit(X_encoded.values, y.values)
+selected_features = X_encoded.columns[boruta_selector.support_].tolist()
+X_boruta = X_encoded[selected_features]
+
+# Polynomial features (degree=2, interaction only)
+poly = PolynomialFeatures(degree=2, interaction_only=True, include_bias=False)
+X_poly = poly.fit_transform(X_boruta)
+poly_features = poly.get_feature_names_out(selected_features)
+X_poly_df = pd.DataFrame(X_poly, columns=poly_features, index=X_boruta.index)
+
+# Select top 60 features by mutual info (you can tweak k for speed/accuracy)
+k = min(60, X_poly_df.shape[1])
+selector = SelectKBest(mutual_info_classif, k=k)
+X_final = selector.fit_transform(X_poly_df, y)
+final_features = X_poly_df.columns[selector.get_support()].tolist()
+
+# Scale features
+scaler = RobustScaler()
+X_scaled = scaler.fit_transform(X_final)
+
+# Balance data with SMOTEENN (defaults for speed)
+smote_enn = SMOTEENN(random_state=42)
+X_res, y_res = smote_enn.fit_resample(X_scaled, y)
+
+print(f"Original shape: {X.shape}, Resampled shape: {X_res.shape}, Class distribution:\n{y_res.value_counts()}")
+
+# Cross-validation setup
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+
+# Models: tuned for balance of speed and accuracy
+xgb = XGBClassifier(
+    objective='multi:softprob',
+    use_label_encoder=False,
+    eval_metric='mlogloss',
+    random_state=42,
+    n_jobs=-1,
+    n_estimators=800,
+    learning_rate=0.05,
+    max_depth=6,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    gamma=0.1,
+    reg_alpha=0.1,
+    reg_lambda=0.1,
+    tree_method='hist'
+)
+
+lgbm = LGBMClassifier(
+    objective='multiclass',
+    num_class=len(y.unique()),
+    random_state=42,
+    n_jobs=-1,
+    n_estimators=800,
+    learning_rate=0.05,
+    num_leaves=40,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    reg_alpha=0.1,
+    reg_lambda=0.1,
+    boosting_type='gbdt'
+)
+
+cat = CatBoostClassifier(
+    verbose=0,
+    random_seed=42,
+    iterations=800,
+    learning_rate=0.05,
+    depth=6,
+    l2_leaf_reg=3,
+    border_count=128,
+    thread_count=-1,
+    loss_function='MultiClass',
+    early_stopping_rounds=30
+)
+
+mlp = MLPClassifier(
+    hidden_layer_sizes=(80, 40),
+    activation='relu',
+    solver='adam',
+    alpha=0.001,
+    batch_size='auto',
+    learning_rate_init=0.01,
+    max_iter=300,
+    random_state=42,
+    early_stopping=True,
+    n_iter_no_change=20
+)
+
+# Train individual models
+print("Training models...")
+xgb.fit(X_res, y_res)
+lgbm.fit(X_res, y_res)
+cat.fit(X_res, y_res)
+mlp.fit(X_res, y_res)
+
+# Voting ensemble (soft voting)
+voting = VotingClassifier(
+    estimators=[('xgb', xgb), ('lgbm', lgbm), ('cat', cat), ('mlp', mlp)],
+    voting='soft',
+    n_jobs=-1,
+    weights=[0.35, 0.35, 0.2, 0.1]
+)
+voting.fit(X_res, y_res)
+
+# Evaluate with cross-validation
+print("\nEvaluating Voting Ensemble with 5-fold CV...")
+cv_score = cross_val_score(voting, X_res, y_res, cv=cv, scoring='accuracy')
+print(f"Mean CV accuracy: {cv_score.mean()*100:.2f}% (+/- {cv_score.std()*100:.2f}%)")
+   
+
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+
+# ... [Include the entire preprocessing and model training code from above up to resampling] ...
+
+# After resampling with SMOTEENN (X_res, y_res) and scaling (already done)...
+
+# Base models for stacking (same as before)
+base_estimators = [
+    ('xgb', xgb),
+    ('lgbm', lgbm),
+    ('cat', cat),
+    ('mlp', mlp)
+]
+
+# Meta-model: Logistic Regression for fast and stable stacking
+meta_model = LogisticRegression(max_iter=500, random_state=42)
+
+# Stacking classifier
+stacking_clf = StackingClassifier(
+    estimators=base_estimators,
+    final_estimator=meta_model,
+    cv=5,
+    n_jobs=-1,
+    passthrough=False,  # Only use predictions as meta-features
+    verbose=1
+)
+
+print("Training stacking classifier...")
+stacking_clf.fit(X_res, y_res)
+
+print("\nEvaluating Stacking Classifier with 5-fold CV...")
+cv_score_stack = cross_val_score(stacking_clf, X_res, y_res, cv=cv, scoring='accuracy')
+print(f"Mean CV accuracy (stacking): {cv_score_stack.mean()*100:.2f}% (+/- {cv_score_stack.std()*100:.2f}%)")
