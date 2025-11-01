@@ -22,7 +22,7 @@ An advanced ML web app that predicts multiple diabetes classes using structured 
 
 ## 🧪 Run Locally  
 ```bash
-git clone https://github.com/<your-username>/<repo-name>.git
-cd <repo-name>
+git clone https://github.com/bharti2602/Diabetes-Pred.git
+cd Diabetes-Pred
 pip install -r requirements.txt
 python app.py
